@@ -1,0 +1,8 @@
+Here some learning resource using in this project:
+1- https://github.com/Optimization-Algorithms-Book/Code-Listings/tree/main # This main source for understanding VRP
+2- https://github.com/Dr-AlaaKhamis/Optimization-Algorithms-Course # This is powerpoint files for understanding
+essensial vrp concepts
+3- https://smartmobilityalgorithms.github.io/book/index.html # easier version for source 1, but it is not maintained
+and some codes does not work
+4- https://developers.google.com/optimization/routing # google guide of using or-tools
+5- https://chatgpt.com/ # for learning difference between each librarires, example codes each one
