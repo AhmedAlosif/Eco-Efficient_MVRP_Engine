@@ -1,3 +1,4 @@
+<pre>
 Solomon Classes
 C1:
 1- Structure: Clustered, short Time Window
@@ -29,3 +30,4 @@ CUST NO.  XCOORD.   YCOORD.    DEMAND   READY TIME  DUE DATE   SERVICE TIME
     1       x1        y2         q1         e1          l1            s1  
   ...     ...        ...        ...        ...         ...           ... 
   100     x100      y100       q100       e100        l100          s100
+</pre>
