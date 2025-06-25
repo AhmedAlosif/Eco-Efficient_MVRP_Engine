@@ -1,1 +1,1 @@
-streamlit, OR-tools, DEAP, osmnx, geopandas, folium, requests, overpass, nominatim, networkx
+streamlit, OR-tools, DEAP, osmnx, geopandas, folium, requests, json, networkx
