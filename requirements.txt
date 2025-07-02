@@ -1,1 +1,1 @@
-streamlit, OR-tools, DEAP, osmnx, geopandas, folium, requests, json, networkx, streamlit_folium, pyyaml
+streamlit, OR-tools, deap, osmnx, geopandas, folium, requests, json, networkx, streamlit_folium, pyyaml
