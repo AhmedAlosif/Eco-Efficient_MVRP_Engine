@@ -1,0 +1,269 @@
+import dash
+import dash_bootstrap_components as dbc
+from dash import dcc, html, Input, Output, State, ctx
+import geopandas as gpd
+import pandas as pd
+import osmnx as ox
+import math
+import tempfile
+import os
+import json
+import folium
+import io
+import time
+from branca.element import Figure
+import fiona
+import psutil
+import shapely.geometry
+
+TILE_SIZE_DEG = 0.009
+MAX_SAFE_TILES = 100
+
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+server = app.server
+
+app.layout = dbc.Container([
+    html.H1("🗺️ Tiled OSM Downloader with RAM Estimation + Export", className="my-3"),
+
+    dbc.Row([
+        dbc.Col([
+            dbc.Input(id="location-input", placeholder="Enter location (e.g., Manhattan, New York, USA)", type="text"),
+            html.Br(),
+            dcc.Checklist(
+                id="tag-selector",
+                options=[{"label": tag, "value": tag} for tag in ["building", "highway", "landuse", "natural", "amenity", "leisure", "railway"]],
+                value=["highway"],
+                labelStyle={"display": "block"}
+            ),
+            html.Br(),
+            dbc.RadioItems(
+                id='memory-mode',
+                options=[
+                    {"label": "In Memory (Fast)", "value": "ram"},
+                    {"label": "Cache to Disk (Safe for large areas)", "value": "disk"},
+                    {"label": "Stream to GeoJSON (Low RAM)", "value": "stream"},
+                    {"label": "Line-by-Line Merge (Low RAM, Safe)", "value": "merge"},
+                    {"label": "Manual Load (Ultra Low RAM)", "value": "manual"}
+                ],
+                value="ram",
+                inline=False
+            ),
+            html.Br(),
+            dbc.Button("Estimate RAM & Tiles", id="estimate-btn", color="primary"),
+            html.Br(), html.Br(),
+            dbc.RadioItems(
+                id="confirm-download",
+                options=[
+                    {"label": "Yes, download tiles", "value": "yes"},
+                    {"label": "No, cancel", "value": "no"}
+                ],
+                value="no",
+                inline=True
+            ),
+            html.Br(),
+            dbc.Button("📥 Download GeoJSON", id="download-button", color="success")
+        ], width=4),
+
+        dbc.Col([
+            html.Div(id="estimation-output"),
+            html.Div(id="progress-output"),
+            html.Iframe(id="map-frame", width="100%", height="600"),
+            dcc.Download(id="geojson-download")
+        ], width=8),
+    ])
+])
+
+cached_geojson = {"data": None}
+
+def get_tiles(bounds, tile_size_deg):
+    north, south, east, west = bounds
+    lat_steps = math.ceil((north - south) / tile_size_deg)
+    lon_steps = math.ceil((east - west) / tile_size_deg)
+    tiles = []
+    for i in range(lat_steps):
+        for j in range(lon_steps):
+            n = north - i * tile_size_deg
+            s = max(n - tile_size_deg, south)
+            w = west + j * tile_size_deg
+            e = min(w + tile_size_deg, east)
+            tiles.append((n, s, e, w))
+    return tiles
+
+def print_memory(step=""):
+    mem = psutil.virtual_memory()
+    print(f"[{step}] Used: {mem.used / (1024 ** 3):.2f} GB | Available: {mem.available / (1024 ** 3):.2f} GB")
+
+def stream_tiles_to_geojson(file_path, gdfs, crs):
+    all_keys = set()
+    for gdf in gdfs:
+        for col in gdf.columns:
+            if col != 'geometry':
+                all_keys.add(col)
+
+    schema = {
+        'geometry': 'Unknown',
+        'properties': {key: 'str' for key in all_keys}
+    }
+
+    with fiona.open(file_path, 'w', driver='GeoJSON', crs=crs, schema=schema) as output:
+        for gdf in gdfs:
+            for _, row in gdf.iterrows():
+                props = {k: str(row.get(k)) if row.get(k) is not None else None for k in all_keys}
+                output.write({
+                    'geometry': shapely.geometry.mapping(row.geometry),
+                    'properties': props
+                })
+
+def merge_geojson_line_by_line(file_path, gdfs):
+    print("🔄 Starting line-by-line merge...")
+    features = []
+    for gdf in gdfs:
+        for _, row in gdf.iterrows():
+            feature = {
+                "type": "Feature",
+                "geometry": shapely.geometry.mapping(row.geometry),
+                "properties": {k: str(v) for k, v in row.items() if k != 'geometry'}
+            }
+            features.append(feature)
+    geojson_obj = {
+        "type": "FeatureCollection",
+        "features": features
+    }
+    with open(file_path, "w") as f:
+        json.dump(geojson_obj, f)
+    print(f"✅ Merge complete. File written to {file_path}")
+
+@app.callback(
+    Output("estimation-output", "children"),
+    Input("estimate-btn", "n_clicks"),
+    State("location-input", "value"),
+    State("tag-selector", "value")
+)
+def estimate_usage(n_clicks, location, selected_tags):
+    if not location or not selected_tags:
+        return "Please enter location and select tags."
+
+    try:
+        bounds = ox.geocode_to_gdf(location).total_bounds
+        west, south, east, north = bounds
+        tags = {tag: True for tag in selected_tags}
+        tiles = get_tiles((north, south, east, west), TILE_SIZE_DEG)
+
+        sample_tile = tiles[min(2, len(tiles) - 1)]
+        sample = ox.features_from_bbox((sample_tile[3], sample_tile[1], sample_tile[2], sample_tile[0]), tags)
+        sample_ram_mb = sample.memory_usage(deep=True).sum() / (1024 ** 2)
+        estimated_ram = sample_ram_mb * len(tiles)
+
+        return html.Div([
+            html.P(f"📐 Bounds: N={north:.4f}, S={south:.4f}, E={east:.4f}, W={west:.4f}"),
+            html.P(f"🧱 Total tiles: {len(tiles)}"),
+            html.P(f"🧠 Estimated RAM usage: ~{estimated_ram:.2f} MB"),
+            html.Div(id="tile-meta", style={"display": "none"}, **{"data-tiles": json.dumps(tiles), "data-tags": json.dumps(tags)})
+        ])
+    except Exception as e:
+        return f"Error estimating: {e}"
+
+@app.callback(
+    Output("progress-output", "children"),
+    Output("map-frame", "srcDoc"),
+    Input("confirm-download", "value"),
+    State("tile-meta", "data-tiles"),
+    State("tile-meta", "data-tags"),
+    State("memory-mode", "value"),
+    prevent_initial_call=True
+)
+def download_tiles(confirm, tile_json, tag_json, memory_mode):
+    if confirm != "yes":
+        return "Download canceled.", dash.no_update
+
+    try:
+        tiles = json.loads(tile_json)
+        tags = json.loads(tag_json)
+
+        crs = None
+        results = []
+        temp_dir = tempfile.TemporaryDirectory() if memory_mode == "disk" else None
+        file_paths = []
+
+        for i, (n, s, e, w) in enumerate(tiles):
+            print(f"Downloading tile {i+1} at {time.time()}")
+            print_memory(f"Before tile {i+1}")
+            try:
+                gdf = ox.features_from_bbox((w, s, e, n), tags)
+            except Exception as e:
+                print(f"Failed to download tile {i+1}: {e}")
+                continue
+            print_memory(f"After tile {i+1}")
+
+            if gdf.empty:
+                continue
+
+            if crs is None:
+                crs = gdf.crs
+
+            if memory_mode in ["ram", "stream", "merge"]:
+                results.append(gdf)
+            elif memory_mode == "disk":
+                path = os.path.join(temp_dir.name, f"tile_{i}.feather")
+                gdf.to_feather(path)
+                file_paths.append(path)
+
+        if not results and memory_mode in ["ram", "stream", "merge"]:
+            return "⚠️ No features found in any tile.", dash.no_update
+        if not file_paths and memory_mode == "disk":
+            return "⚠️ No features found in any tile.", dash.no_update
+
+        if memory_mode == "stream":
+            output_path = os.path.join(tempfile.gettempdir(), "streamed.geojson")
+            stream_tiles_to_geojson(output_path, results, crs)
+            with open(output_path, "r") as f:
+                geojson_data = f.read()
+            cached_geojson["data"] = geojson_data
+        elif memory_mode == "merge":
+            output_path = os.path.join(tempfile.gettempdir(), "merged.geojson")
+            merge_geojson_line_by_line(output_path, results)
+            with open(output_path, "r") as f:
+                geojson_data = f.read()
+            cached_geojson["data"] = geojson_data
+        elif memory_mode == "ram":
+            merged = gpd.GeoDataFrame(pd.concat(results, ignore_index=True), crs=crs)
+            merged = merged.to_crs(epsg=4326)
+            cached_geojson["data"] = merged.to_json()
+        elif memory_mode == "disk":
+            loaded = [gpd.read_feather(p) for p in file_paths]
+            merged = gpd.GeoDataFrame(pd.concat(loaded, ignore_index=True), crs=crs)
+            merged = merged.to_crs(epsg=4326)
+            cached_geojson["data"] = merged.to_json()
+        elif memory_mode == "manual":
+            output_path = os.path.join(tempfile.gettempdir(), "manual.geojson")
+            stream_tiles_to_geojson(output_path, results, crs)
+            cached_geojson["data"] = None  # don't load into memory
+            return f"✅ Tiles downloaded. Please load the result manually from: {output_path}", dash.no_update
+
+        gdf_to_map = gpd.read_file(io.StringIO(cached_geojson["data"]))
+        center = [gdf_to_map.geometry.centroid.y.mean(), gdf_to_map.geometry.centroid.x.mean()]
+        m = folium.Map(location=center, zoom_start=13)
+        folium.GeoJson(gdf_to_map).add_to(m)
+
+        fig = Figure()
+        fig.add_child(m)
+        html_data = fig.render()
+
+        return f"✅ Download complete.", html_data
+
+    except Exception as e:
+        return f"❌ Error: {e}", dash.no_update
+
+@app.callback(
+    Output("geojson-download", "data"),
+    Input("download-button", "n_clicks"),
+    prevent_initial_call=True
+)
+def download_geojson(n):
+    geojson = cached_geojson.get("data")
+    if geojson:
+        return dict(content=geojson, filename="osm_features.geojson")
+    return dash.no_update
+
+if __name__ == "__main__":
+    app.run(debug=True)
