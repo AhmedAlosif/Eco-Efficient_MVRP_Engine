@@ -1,0 +1,197 @@
+import dash
+import dash_bootstrap_components as dbc
+from dash import dcc, html, Input, Output, State, ctx
+import geopandas as gpd
+import dask_geopandas as dgpd
+import pandas as pd
+import osmnx as ox
+import math
+import tempfile
+import os
+import json
+import folium
+import base64
+import io
+import time
+from folium import Map, GeoJson
+from branca.element import Figure
+import fiona
+import psutil
+import shapely.geometry
+from dask.distributed import Client, LocalCluster
+import multiprocessing
+import dask.dataframe as dd
+
+TILE_SIZE_DEG = 0.009
+MAX_SAFE_TILES = 100
+
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+server = app.server
+
+app.layout = dbc.Container([
+    html.H1("🗺️ Tiled OSM Downloader with RAM Estimation + Export", className="my-3"),
+
+    dbc.Row([
+        dbc.Col([
+            dbc.Input(id="location-input", placeholder="Enter location (e.g., Manhattan, New York, USA)", type="text"),
+            html.Br(),
+            dcc.Checklist(
+                id="tag-selector",
+                options=[{"label": tag, "value": tag} for tag in ["building", "highway", "landuse", "natural", "amenity", "leisure", "railway"]],
+                value=["highway"],
+                labelStyle={"display": "block"}
+            ),
+            html.Br(),
+            dbc.RadioItems(
+                id='memory-mode',
+                options=[
+                    {"label": "In Memory (Fast)", "value": "ram"},
+                    {"label": "Cache to Disk (Safe for large areas)", "value": "disk"},
+                    {"label": "Stream to GeoJSON (Low RAM)", "value": "stream"},
+                    {"label": "Line-by-Line Merge (Low RAM, Safe)", "value": "merge"},
+                    {"label": "Manual Load (Ultra Low RAM)", "value": "manual"}
+                ],
+                value="ram",
+                inline=False
+            ),
+            html.Br(),
+            dbc.Button("Estimate RAM & Tiles", id="estimate-btn", color="primary"),
+            html.Br(), html.Br(),
+            dbc.RadioItems(
+                id="confirm-download",
+                options=[
+                    {"label": "Yes, download tiles", "value": "yes"},
+                    {"label": "No, cancel", "value": "no"}
+                ],
+                value="no",
+                inline=True
+            ),
+            html.Br(),
+            dbc.Button("📥 Download GeoJSON", id="download-button", color="success"),
+            html.Br(),
+            dbc.Button("📂 Load with Manual Chunking", id="manual-load-btn", color="info"),
+            html.Br(),
+            dbc.Button("🔄 Convert GeoJSON to Parquet", id="convert-parquet-btn", color="secondary"),
+            html.Br(),
+            dbc.Input(id="parquet-path-input", placeholder="Enter path to Parquet file...", type="text"),
+            dbc.Button("📊 Visualize Parquet", id="visualize-parquet-btn", color="dark"),
+        ], width=4),
+
+        dbc.Col([
+            html.Div(id="estimation-output"),
+            html.Div(id="progress-output"),
+            html.Iframe(id="map-frame", width="100%", height="600"),
+            dcc.Download(id="geojson-download")
+        ], width=8),
+    ])
+])
+
+cached_geojson = {"data": None}
+
+def get_tiles(bounds, tile_size_deg):
+    north, south, east, west = bounds
+    lat_steps = math.ceil((north - south) / tile_size_deg)
+    lon_steps = math.ceil((east - west) / tile_size_deg)
+    tiles = []
+    for i in range(lat_steps):
+        for j in range(lon_steps):
+            n = north - i * tile_size_deg
+            s = max(n - tile_size_deg, south)
+            w = west + j * tile_size_deg
+            e = min(w + tile_size_deg, east)
+            tiles.append((n, s, e, w))
+    return tiles
+
+def print_memory(step=""):
+    mem = psutil.virtual_memory()
+    print(f"[{step}] Used: {mem.used / (1024 ** 3):.2f} GB | Available: {mem.available / (1024 ** 3):.2f} GB")
+
+def process_chunk(df):
+    print("🔍 Processing chunk...")
+    df = df[df.geometry.notnull() & df.geometry.is_valid]
+    print(f"✅ Chunk size after filter: {len(df)}")
+    return df
+
+def manual_load_chunks(path, npartitions=10):
+    print("🔄 Starting manual load with Dask...")
+    print_memory("Before read_file")
+    ddf = dgpd.read_file(path, npartitions=npartitions)
+    print("✅ File read into Dask GeoDataFrame")
+    print_memory("After read_file")
+    ddf = ddf.map_partitions(process_chunk)
+    print("🔄 Computing Dask GeoDataFrame...")
+    print_memory("Before compute")
+    gdf = ddf.compute()
+    print_memory("After compute")
+    print("✅ Manual chunk load complete.")
+    return gdf
+
+@app.callback(
+    Output("geojson-download", "data"),
+    Input("download-button", "n_clicks"),
+    prevent_initial_call=True
+)
+def download_geojson(n):
+    geojson = cached_geojson.get("data")
+    if geojson:
+        return dict(content=geojson, filename="osm_features.geojson")
+    return dash.no_update
+
+@app.callback(
+    Output("progress-output", "children"),
+    Input("manual-load-btn", "n_clicks"),
+    prevent_initial_call=True
+)
+def trigger_manual_load(n_clicks):
+    temp_path = "/tmp/merged.geojson"
+    try:
+        gdf = manual_load_chunks(temp_path, npartitions=12)
+        return f"✅ Loaded {len(gdf)} features from {temp_path} using Dask."
+    except Exception as e:
+        return f"❌ Error loading manually: {e}"
+
+@app.callback(
+    Output("progress-output", "children", allow_duplicate=True),
+    Input("convert-parquet-btn", "n_clicks"),
+    prevent_initial_call=True
+)
+def convert_geojson_to_parquet(n_clicks):
+    path = "/tmp/merged.geojson"
+    try:
+        gdf = gpd.read_file(path)
+        parquet_path = "/tmp/converted.parquet"
+        gdf.to_parquet(parquet_path)
+        return f"✅ Converted to Parquet at {parquet_path}"
+    except Exception as e:
+        return f"❌ Error converting to Parquet: {e}"
+
+@app.callback(
+    Output("map-frame", "srcDoc"),
+    Input("visualize-parquet-btn", "n_clicks"),
+    State("parquet-path-input", "value"),
+    prevent_initial_call=True
+)
+def visualize_parquet_map(n_clicks, parquet_path):
+    try:
+        ddf = dd.read_parquet(parquet_path)
+        gdf = ddf.compute()
+        center = [gdf.geometry.centroid.y.mean(), gdf.geometry.centroid.x.mean()]
+        fig = Figure()
+        m = Map(location=center, zoom_start=13)
+        GeoJson(gdf).add_to(m)
+        fig.add_child(m)
+        return m.get_root().render()
+    except Exception as e:
+        return f"<p>Error visualizing Parquet file: {e}</p>"
+
+if __name__ == "__main__":
+    num_cores = multiprocessing.cpu_count()
+    cluster = LocalCluster(
+        n_workers=num_cores,             # One worker per core
+        threads_per_worker=1,            # Avoid thread contention
+        memory_limit='24GB'               # Dask auto-assigns memory per worker
+    )
+    client = Client(cluster)
+    print("🔌 Dask client connected:", client)
+    print("Dask dashboard:", client.dashboard_link)
+    app.run(debug=True)
